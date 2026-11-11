@@ -19,6 +19,7 @@ from twisted.internet.defer import Deferred
 from scrapy import signals
 from scrapy.core.downloader.middleware import DownloaderMiddlewareManager
 from scrapy.downloadermiddlewares.httpcache import HttpCacheMiddleware
+from scrapy.downloadermiddlewares.retry import RetryMiddleware
 from scrapy.exceptions import IgnoreRequest
 from scrapy.extensions.httpcache import DummyPolicy, rfc1123_to_epoch
 from scrapy.http import BodyFileResponse, HtmlResponse, Request, Response
@@ -33,6 +34,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable, Generator
 
     from scrapy.crawler import Crawler
+    from tests.mockserver.http import MockServer
 
 
 class CustomResponse(Response):
@@ -1198,6 +1200,65 @@ class TestConcurrentDownloads(TestBase):
             assert download.urls == [self.url]
             assert not self._middleware_of(manager, HttpCacheMiddleware)._downloading
 
+    @coroutine_test
+    async def test_retry_releases_the_waiter(self):
+        # A retry status makes RetryMiddleware return a new request. The cache
+        # middleware still runs (it sits further out), wakes the waiter, and
+        # leaves no in-flight state behind for either the leader or the waiter.
+        with self._manager(
+            DOWNLOADER_MIDDLEWARES={RetryMiddleware: 550},
+            RETRY_TIMES=1,
+            RETRY_HTTP_CODES=[500],
+        ) as (manager, crawler):
+            download = _Downloads(status=500)
+            _request, first, second = await self._start(manager, download, crawler)
+            download.release()
+
+            # Both calls hand the retry Request back to the engine.
+            assert isinstance(await maybe_deferred_to_future(first), Request)
+            assert isinstance(await maybe_deferred_to_future(second), Request)
+            assert not self._middleware_of(manager, HttpCacheMiddleware)._downloading
+
+    @coroutine_test
+    async def test_second_round_after_failed_first_round(self):
+        # After the leader fails and its waiter takes over as the new in-flight
+        # download, a further identical request must join that round rather than
+        # start a third one, and the state must be released at the end.
+        with self._manager() as (manager, crawler):
+            download = _Downloads()
+            middleware = self._middleware_of(manager, HttpCacheMiddleware)
+            leader = Request(self.url)
+            first = deferred_from_coro(manager.download_async(download, leader))
+            await self._wait_until(lambda: download.urls)
+            waiter = deferred_from_coro(
+                manager.download_async(download, Request(self.url))
+            )
+            await self._wait_until(lambda: crawler.stats.get_value("httpcache/wait"))
+
+            # Fail the leader: the waiter wakes and becomes the new leader.
+            download._blocked.pop(0).errback(ValueError("Download failure"))
+            with pytest.raises(ValueError, match="Download failure"):
+                await maybe_deferred_to_future(first)
+            await self._wait_until(lambda: len(download.urls) == 2)
+
+            # A third identical request now waits on the second round.
+            third = deferred_from_coro(
+                manager.download_async(download, Request(self.url))
+            )
+            await self._wait_until(
+                lambda: crawler.stats.get_value("httpcache/wait") == 2
+            )
+            assert len(middleware._downloading) == 1
+
+            download.release()
+            waiter_response = await maybe_deferred_to_future(waiter)
+            assert isinstance(waiter_response, Response)
+            third_response = await maybe_deferred_to_future(third)
+            assert isinstance(third_response, Response)
+            assert "cached" in third_response.flags
+            assert not middleware._downloading
+            assert download.urls == [self.url] * 2
+
 
 class TestInFlightTracking(TestBase):
     """Bookkeeping of requests that are being downloaded."""
@@ -1242,11 +1303,86 @@ class TestInFlightTracking(TestBase):
 
             assert mw.crawler.spider
             mw.spider_closed(mw.crawler.spider)
+            # Closing wakes the waiter but stops it from reading the storage or
+            # taking over as a new in-flight download.
             assert await maybe_deferred_to_future(waiting) is None
-            # The woken request found no cache entry, so it took over as the
-            # in-flight download, with a fresh list of waiters.
             assert not waiters
-            assert mw._downloading.get(fingerprint) is not waiters
+            assert not mw._downloading
+            assert mw._closing
+
+    @pytest.mark.parametrize(
+        "storage_class",
+        [
+            "scrapy.extensions.httpcache.FilesystemCacheStorage",
+            "scrapy.extensions.httpcache.DbmCacheStorage",
+        ],
+    )
+    @coroutine_test
+    async def test_spider_closed_does_not_touch_closed_storage(
+        self, storage_class: str
+    ) -> None:
+        # A woken waiter must not read the storage once spider_closed() starts
+        # closing it. With DBM storage, reading a closed database raises, which
+        # used to be counted as a retrieval error.
+        self.storage_class = storage_class
+        with self._middleware() as mw:
+            leader = Request(self.url)
+            assert await mw.process_request(leader) is None
+            waiting = deferred_from_coro(mw.process_request(Request(self.url)))
+            for _ in range(100):
+                if mw.crawler.stats.get_value("httpcache/wait"):
+                    break
+                await sleep(0)
+            # Make the waiter find a cache entry if it wrongly reads the storage
+            # after being woken up.
+            mw._cache_response(Response(self.url, body=b"cached"), leader)
+
+            assert mw.crawler.spider
+            mw.spider_closed(mw.crawler.spider)
+
+            assert await maybe_deferred_to_future(waiting) is None
+            assert mw.crawler.stats.get_value("httpcache/retrieve_error") is None
+            assert not mw._downloading
+
+    @coroutine_test
+    async def test_stale_wake_keeps_a_new_round(self):
+        # A wake tied to a finished round must not delete the in-flight state of
+        # a later round that uses the same request fingerprint.
+        with self._middleware() as mw:
+            first = Request(self.url)
+            assert await mw.process_request(first) is None
+            fingerprint = mw._fingerprinter.fingerprint(first)
+            first_waiters = mw._downloading[fingerprint]
+
+            del first
+            gc.collect()
+            assert fingerprint not in mw._downloading
+
+            second = Request(self.url)
+            assert await mw.process_request(second) is None
+            second_waiters = mw._downloading[fingerprint]
+            assert second_waiters is not first_waiters
+
+            # The finalizer of the garbage-collected first request must not
+            # touch the state of the second round.
+            mw._wake(fingerprint, first_waiters)
+            assert mw._downloading.get(fingerprint) is second_waiters
+
+            mw.process_response(second, Response(self.url, body=b"body"))
+            assert not mw._downloading
+
+    @coroutine_test
+    async def test_request_after_close_is_not_tracked(self):
+        # Once the spider is closing, a request must skip the cache entirely and
+        # must never register in-flight state that nothing would release.
+        with self._middleware() as mw:
+            assert mw.crawler.spider
+            mw.spider_closed(mw.crawler.spider)
+            request = Request(self.url)
+            assert await mw.process_request(request) is None
+            assert not mw._downloading
+            assert "_httpcache_downloading" not in request.meta
+            assert mw.process_response(request, Response(self.url)) is not None
 
 
 class ScopeTestMixin(TestBase):
@@ -1339,3 +1475,106 @@ class TestDbmStorageScope(ScopeTestMixin):
 )
 def test_rfc1123_to_epoch(string: str | None, expected: int | None) -> None:
     assert rfc1123_to_epoch(string) == expected
+
+
+class _ConcurrentCacheSpider(Spider):
+    """Yield several identical requests at once so that only one is downloaded
+    and the others wait for it and read the cached response."""
+
+    name = "concurrent_cache"
+
+    def __init__(self, url: str, copies: int = 5, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.url = url
+        self.copies = copies
+        self.responses: list[Response] = []
+
+    async def start(self):
+        for _ in range(self.copies):
+            yield Request(self.url, dont_filter=True, callback=self.parse)
+
+    def parse(self, response: Response) -> None:
+        self.responses.append(response)
+
+
+class TestHttpCacheWithMockServer:
+    """End-to-end waiter behavior against the mock HTTP server."""
+
+    @staticmethod
+    def _settings(tmpdir: str, **extra: Any) -> dict[str, Any]:
+        settings = {
+            "HTTPCACHE_ENABLED": True,
+            "HTTPCACHE_DIR": tmpdir,
+            "HTTPCACHE_POLICY": "scrapy.extensions.httpcache.DummyPolicy",
+            "HTTPCACHE_STORAGE": "scrapy.extensions.httpcache.FilesystemCacheStorage",
+            "CONCURRENT_REQUESTS": 8,
+        }
+        settings.update(extra)
+        return settings
+
+    @coroutine_test
+    async def test_concurrent_requests_downloaded_once(
+        self, mockserver: MockServer, tmp_path: Path
+    ) -> None:
+        url = mockserver.url("/delay?n=0.3")
+        crawler = get_crawler(_ConcurrentCacheSpider, self._settings(str(tmp_path)))
+        await crawler.crawl_async(url=url, copies=5, mockserver=mockserver)
+
+        spider = crawler.spider
+        assert isinstance(spider, _ConcurrentCacheSpider)
+        assert len(spider.responses) == 5
+        # Only the first request hit the server; the rest were served cached.
+        assert crawler.stats.get_value("httpcache/wait") == 4
+        assert crawler.stats.get_value("httpcache/store") == 1
+        assert sum("cached" in r.flags for r in spider.responses) == 4
+        middleware = crawler.engine.downloader.middleware
+        cache = next(
+            m for m in middleware.middlewares if isinstance(m, HttpCacheMiddleware)
+        )
+        assert not cache._downloading
+
+    @coroutine_test
+    async def test_restart_serves_cache_without_download(
+        self, mockserver: MockServer, tmp_path: Path
+    ) -> None:
+        url = mockserver.url("/status?n=200")
+        settings = self._settings(str(tmp_path))
+
+        first = get_crawler(_ConcurrentCacheSpider, settings)
+        await first.crawl_async(url=url, copies=1, mockserver=mockserver)
+        assert first.stats.get_value("httpcache/store") == 1
+
+        # A second crawler reusing the same cache directory must read the
+        # response from the cache instead of downloading it again.
+        second = get_crawler(_ConcurrentCacheSpider, settings)
+        await second.crawl_async(url=url, copies=1, mockserver=mockserver)
+        assert second.stats.get_value("httpcache/hit") == 1
+        assert second.stats.get_value("httpcache/store") is None
+        assert second.stats.get_value("httpcache/miss") is None
+
+    @coroutine_test
+    async def test_fast_stop_releases_waiters(
+        self, mockserver: MockServer, tmp_path: Path
+    ) -> None:
+        url = mockserver.url("/delay?n=10")
+        crawler = get_crawler(_ConcurrentCacheSpider, self._settings(str(tmp_path)))
+        crawl = deferred_from_coro(
+            crawler.crawl_async(url=url, copies=5, mockserver=mockserver)
+        )
+        # Four requests are waiting on the first one when the spider is stopped.
+        for _ in range(100):
+            if crawler.stats.get_value("httpcache/wait") == 4:
+                break
+            await sleep(0)
+        await crawler.signals.wait_for(signals.headers_received)
+        await sleep(0)
+
+        await crawler.stop_async(mode="fast")
+        await maybe_deferred_to_future(crawl)
+
+        middleware = crawler.engine.downloader.middleware
+        cache = next(
+            m for m in middleware.middlewares if isinstance(m, HttpCacheMiddleware)
+        )
+        assert not cache._downloading
+        assert crawler.stats.get_value("finish_reason") is not None

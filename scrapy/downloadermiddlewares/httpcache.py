@@ -55,6 +55,7 @@ class HttpCacheMiddleware:
         self.ignore_missing = settings.getbool("HTTPCACHE_IGNORE_MISSING")
         self.stats = stats
         self._downloading: dict[bytes, list[Deferred[None]]] = {}
+        self._closing = False
 
     @classmethod
     def from_crawler(cls, crawler: Crawler) -> Self:
@@ -68,16 +69,26 @@ class HttpCacheMiddleware:
     def spider_opened(self, spider: Spider) -> None:
         self.storage.open_spider(spider)
 
-    def spider_closed(self, spider: Spider) -> None:
+    def _stop_downloading(self) -> None:
+        """Release every request waiting on a concurrent download.
+
+        Woken waiters resume inside this call, so the closing flag is set first
+        to stop them from reading the soon-to-be-closed storage and from
+        registering new in-flight downloads that nothing would release.
+        """
+        self._closing = True
         for fingerprint in list(self._downloading):
             self._wake(fingerprint)
+
+    def spider_closed(self, spider: Spider) -> None:
+        self._stop_downloading()
         self.storage.close_spider(spider)
 
     @_warn_spider_arg
     async def process_request(
         self, request: Request, spider: Spider | None = None
     ) -> Request | Response | None:
-        if request.meta.get("dont_cache", False):
+        if request.meta.get("dont_cache", False) or self._closing:
             return None
 
         # Skip uncacheable requests
@@ -90,6 +101,10 @@ class HttpCacheMiddleware:
         # Look for cached response and check if expired
         cachedresponse = self._retrieve(request)
         if cachedresponse is None and await self._wait_for_download(request):
+            if self._closing:
+                # The spider is being closed and the storage is closed or about
+                # to be, so do not read it or start another tracked download.
+                return None
             cachedresponse = self._retrieve(request)
 
         if cachedresponse is None:
@@ -146,7 +161,7 @@ class HttpCacheMiddleware:
 
     def _mark_downloading(self, request: Request) -> None:
         fingerprint = self._fingerprinter.fingerprint(request)
-        if fingerprint in self._downloading:
+        if fingerprint in self._downloading or self._closing:
             return
         waiters: list[Deferred[None]] = []
         self._downloading[fingerprint] = waiters

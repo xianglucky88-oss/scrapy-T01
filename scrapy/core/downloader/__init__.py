@@ -746,6 +746,9 @@ class Downloader:
 
     async def stop(self) -> int:
         self._accepting_requests = False
+        # Requests blocked inside a downloader middleware, e.g. waiting for a
+        # concurrent download, have no slot task to cancel, so release them here.
+        self.middleware._on_downloader_stop()
 
         dropped_count = 0
 
@@ -786,6 +789,7 @@ class Downloader:
 
     def close(self) -> None:
         self._accepting_requests = False
+        self.middleware._on_downloader_stop()
         self._stop_slot_gc()
         for slot in self.slots.values():
             slot.close()

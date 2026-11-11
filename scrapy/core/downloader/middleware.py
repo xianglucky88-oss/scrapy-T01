@@ -207,6 +207,18 @@ class DownloaderMiddlewareManager(MiddlewareManager):  # pylint: disable=abstrac
 
         return method(**kwargs)
 
+    def _on_downloader_stop(self) -> None:
+        """Release requests held inside the middlewares while the downloader is
+        shutting down.
+
+        Unlike requests being transferred, such requests do not belong to a
+        downloader slot, so :meth:`Downloader.stop` cannot cancel them.
+        """
+        for middleware in self.middlewares:
+            stop_downloading = getattr(middleware, "_stop_downloading", None)
+            if stop_downloading is not None:
+                stop_downloading()
+
     async def _process_request(
         self,
         request: Request,
