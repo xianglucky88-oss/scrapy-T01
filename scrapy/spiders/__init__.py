@@ -67,6 +67,23 @@ class Spider(object_ref):
     ``books_toscrape_com``.
     """
 
+    aliases: Collection[str] = ()
+    """Additional names that resolve to this spider class.
+
+    Use them to keep old names working after renaming a spider, e.g. when
+    a website migration forces a spider rename but existing scripts and
+    schedules still refer to the old name. The default :ref:`spider loader
+    <topics-api-spiderloader>` accepts aliases everywhere a spider name is
+    accepted, e.g. in the :command:`crawl` command or
+    :meth:`CrawlerRunner.crawl <scrapy.crawler.CrawlerRunner.crawl>`, while
+    spider listings and request-based spider matching keep reporting only
+    the canonical :attr:`name`.
+
+    An alias must not be equal to the name or an alias of any spider in
+    the project, including this one; the default spider loader raises
+    :exc:`ValueError` when it finds such a conflict.
+    """
+
     custom_settings: dict[str, Any] | None = None
     """Settings that override the project-wide configuration when running this
     spider. It must be defined as a class attribute, since the settings are

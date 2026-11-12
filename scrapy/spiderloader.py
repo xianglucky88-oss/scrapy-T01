@@ -49,13 +49,20 @@ class SpiderLoader:
     """
     SpiderLoader is a class which locates and loads spiders
     in a Scrapy project.
+
+    Spiders are indexed by their :attr:`~scrapy.Spider.name` and also by
+    their :attr:`~scrapy.Spider.aliases`, so :meth:`load` accepts both,
+    while :meth:`list` and :meth:`find_by_request` only deal with canonical
+    spider names.
     """
 
     def __init__(self, settings: BaseSettings):
         self.spider_modules: list[str] = settings.getlist("SPIDER_MODULES")
         self.warn_only: bool = settings.getbool("SPIDER_LOADER_WARN_ONLY")
         self._spiders: dict[str, type[Spider]] = {}
+        self._aliases: dict[str, type[Spider]] = {}
         self._found: defaultdict[str, list[tuple[str, str]]] = defaultdict(list)
+        self._found_aliases: defaultdict[str, list[tuple[str, str]]] = defaultdict(list)
         self._load_all_spiders()
 
     def _check_name_duplicates(self) -> None:
@@ -78,10 +85,39 @@ class SpiderLoader:
                 category=UserWarning,
             )
 
+    def _check_alias_conflicts(self) -> None:
+        conflicts = []
+        for alias, locations in self._found_aliases.items():
+            claimants = sorted(set(locations))
+            claimant_desc = ", ".join(f"{cls} (in {mod})" for mod, cls in claimants)
+            if alias in self._found:
+                name_owners = ", ".join(
+                    f"{cls} (in {mod})" for mod, cls in sorted(set(self._found[alias]))
+                )
+                conflicts.append(
+                    f"  alias {alias!r} of {claimant_desc} clashes with the "
+                    f"name of {name_owners}"
+                )
+            if len(claimants) > 1:
+                conflicts.append(
+                    f"  alias {alias!r} is claimed by several spiders: {claimant_desc}"
+                )
+
+        if conflicts:
+            conflicts_string = "\n\n".join(conflicts)
+            raise ValueError(
+                "There are conflicting spider aliases:\n\n"
+                f"{conflicts_string}\n\n"
+                "  Aliases must differ from all spider names and aliases."
+            )
+
     def _load_spiders(self, module: ModuleType) -> None:
         for spcls in iter_spider_classes(module):
             self._found[spcls.name].append((module.__name__, spcls.__name__))
             self._spiders[spcls.name] = spcls
+            for alias in getattr(spcls, "aliases", None) or ():
+                self._found_aliases[alias].append((module.__name__, spcls.__name__))
+                self._aliases[alias] = spcls
 
     def _load_all_spiders(self) -> None:
         for name in self.spider_modules:
@@ -100,6 +136,7 @@ class SpiderLoader:
                 else:
                     raise
         self._check_name_duplicates()
+        self._check_alias_conflicts()
 
     @classmethod
     def from_settings(cls, settings: BaseSettings) -> Self:
@@ -114,12 +151,18 @@ class SpiderLoader:
     def load(self, spider_name: str) -> type[Spider]:
         """Return the spider class for the given spider name.
 
+        Besides canonical spider names, :attr:`~scrapy.Spider.aliases` are
+        also accepted.
+
         If the spider name is not found, raise a :exc:`KeyError`.
         """
         try:
             return self._spiders[spider_name]
         except KeyError:
-            raise KeyError(f"Spider not found: {spider_name}") from None
+            try:
+                return self._aliases[spider_name]
+            except KeyError:
+                raise KeyError(f"Spider not found: {spider_name}") from None
 
     def find_by_request(self, request: Request) -> list[str]:
         """

@@ -39,6 +39,8 @@ scrapy.Spider
 
     .. autoattribute:: name
 
+    .. autoattribute:: aliases
+
     .. autoattribute:: allowed_domains
 
     .. autoattribute:: start_urls
