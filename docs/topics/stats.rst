@@ -237,6 +237,35 @@ one per actual value of the placeholder.
 
     Set by :class:`~scrapy.downloadermiddlewares.stats.DownloaderStats`.
 
+.. stat:: downloader/slot/{slot}/selected
+
+``downloader/slot/{slot}/selected``
+    Number of requests assigned to the download slot ``{slot}``, where
+    ``{slot}`` is the value of the :reqmeta:`download_slot` request meta key
+    if set, and the request hostname otherwise (or the resolved IP address
+    when using :setting:`CONCURRENT_REQUESTS_PER_IP`).
+
+    Set by :class:`~scrapy.core.downloader.Downloader`.
+
+.. stat:: downloader/slot/{slot}/started
+
+``downloader/slot/{slot}/started``
+    Number of requests assigned to the download slot ``{slot}`` (see
+    :stat:`downloader/slot/{slot}/selected`) whose download started.
+
+    Set by :class:`~scrapy.core.downloader.Downloader`.
+
+.. stat:: downloader/slot/{slot}/completed
+
+``downloader/slot/{slot}/completed``
+    Number of requests assigned to the download slot ``{slot}`` (see
+    :stat:`downloader/slot/{slot}/selected`) whose download finished, whether
+    it succeeded or failed. The difference between
+    :stat:`downloader/slot/{slot}/started` and this stat is the number of
+    downloads of the slot currently in flight.
+
+    Set by :class:`~scrapy.core.downloader.Downloader`.
+
 .. stat:: dupefilter/filtered
 
 ``dupefilter/filtered``

@@ -455,6 +455,17 @@ class Downloader:
 
         return key
 
+    def _inc_slot_stat(self, key: str, stat: str) -> None:
+        """Increment the *stat* counter of the download slot *key*.
+
+        Slot stats are keyed by slot name, whether the slot comes from the
+        ``download_slot`` request meta key or from the request hostname, so
+        that extensions and logs can read them from the stats collector
+        without inspecting downloader internals.
+        """
+        if self._stats is not None:
+            self._stats.inc_value(f"downloader/slot/{key}/{stat}")
+
     async def _delay_request(self, request: Request) -> None:
         """Hold *request* until the deadline of its ``delay`` meta key.
 
@@ -493,6 +504,7 @@ class Downloader:
             request.meta[_STAMPED_SLOT_META_KEY] = key
         request.meta[self.DOWNLOAD_SLOT] = key
         slot.active.add(request)
+        self._inc_slot_stat(key, "selected")
         self.signals.send_catch_log(
             signal=signals.request_reached_downloader,
             request=request,
@@ -575,6 +587,12 @@ class Downloader:
 
     async def _download(self, slot: Slot, request: Request) -> Response:
         # The order is very important for the following logic. Do not change!
+        # Set by _enqueue_request() before the request is queued; requests
+        # that reach _download() some other way, e.g. through a subclass, get
+        # no slot stats.
+        slot_key: str | None = request.meta.get(self.DOWNLOAD_SLOT)
+        if slot_key is not None:
+            self._inc_slot_stat(slot_key, "started")
         try:
             # 1. Download the response
             response: Response = await self.handlers.download_request_async(request)
@@ -598,6 +616,8 @@ class Downloader:
             # state to free up the transferring slot so it can be used by the
             # following requests (perhaps those which came from the downloader
             # middleware itself)
+            if slot_key is not None:
+                self._inc_slot_stat(slot_key, "completed")
             self._end_transfer(slot, request)
 
     def _add_unscheduled_request(self, request: Request) -> None:

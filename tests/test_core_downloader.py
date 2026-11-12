@@ -888,6 +888,92 @@ async def test_slot_concurrency() -> None:
     assert crawler.stats.get_value("response_received_count") == 10
 
 
+class InstantHandler(BaseDownloadHandler):
+    """Download handler that responds immediately, without network I/O."""
+
+    async def download_request(self, request: Request) -> Response:
+        return Response(request.url)
+
+
+class SlotStatsSpider(Spider):
+    name = "slot_stats"
+
+    async def start(self):
+        for i in range(3):
+            yield Request(f"https://example.com/{i}")
+        yield Request("https://example.net/", meta={"download_slot": "custom"})
+
+    def parse(self, response):
+        pass
+
+
+@coroutine_test
+async def test_slot_stats() -> None:
+    """The downloader keeps per-slot stats, keyed by the slot name, for both
+    hostname slots and slots set with the download_slot meta key."""
+    crawler = get_crawler(
+        SlotStatsSpider,
+        {"DOWNLOAD_HANDLERS": {"https": InstantHandler}},
+    )
+    await crawler.crawl_async()
+    stats = crawler.stats
+    for event in ("selected", "started", "completed"):
+        assert stats.get_value(f"downloader/slot/example.com/{event}") == 3
+        assert stats.get_value(f"downloader/slot/custom/{event}") == 1
+
+
+@coroutine_test
+async def test_slot_stats_failed_download() -> None:
+    """Failed downloads also count as completed, so that started minus
+    completed is the number of downloads of the slot in flight."""
+
+    class FailingHandler(BaseDownloadHandler):
+        async def download_request(self, request: Request) -> Response:
+            raise ValueError("boom")
+
+    class ErrbackSpider(Spider):
+        name = "errback"
+
+        async def start(self):
+            yield Request("https://example.com/", errback=self.errback)
+
+        def parse(self, response):
+            pass
+
+        def errback(self, failure):
+            pass
+
+    crawler = get_crawler(
+        ErrbackSpider,
+        {"DOWNLOAD_HANDLERS": {"https": FailingHandler}},
+    )
+    await crawler.crawl_async()
+    stats = crawler.stats
+    assert stats.get_value("downloader/slot/example.com/selected") == 1
+    assert stats.get_value("downloader/slot/example.com/started") == 1
+    assert stats.get_value("downloader/slot/example.com/completed") == 1
+
+
+@coroutine_test
+async def test_slot_stats_fetch() -> None:
+    """Slot stats are also recorded for requests fetched directly through the
+    downloader, outside of a crawl."""
+    crawler = get_crawler(DefaultSpider)
+    crawler.spider = crawler._create_spider()
+    downloader = Downloader(crawler)
+    try:
+        await maybe_deferred_to_future(
+            downloader.fetch(Request("data:,", meta={"download_slot": "myslot"}))
+        )
+        stats = crawler.stats
+        assert stats.get_value("downloader/slot/myslot/selected") == 1
+        assert stats.get_value("downloader/slot/myslot/started") == 1
+        assert stats.get_value("downloader/slot/myslot/completed") == 1
+    finally:
+        downloader.close()
+        await downloader.handlers._close()
+
+
 def test_deprecated_tls_module_names() -> None:
     with pytest.warns(
         ScrapyDeprecationWarning,
